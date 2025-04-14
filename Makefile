@@ -1,5 +1,5 @@
 NVCC := nvcc
-CFLAGS := -O2
+CFLAGS := -O2 -std=c++11
 
 all: conv2dV1 conv2dV2
 
