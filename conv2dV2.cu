@@ -4,6 +4,7 @@
 #include <iomanip>
 
 #define BLOCK_SIZE 16
+#define MAX_FILTER_SIZE 49  // max 7x7 filters
 
 void readInput(const char* fileName, float*& h_input, int& H, int& W, int& N) {
     std::ifstream inFile(fileName);
@@ -52,6 +53,7 @@ void writeOutput(float* h_output, int H, int W, int N, int K) {
 
 __global__ void conv2d_shared_kernel(float* input, float* filter, float* output, int H, int W, int N, int K, int R) {
     extern __shared__ float sh_input[];
+    __shared__ float sh_filter[MAX_FILTER_SIZE];
 
     int tx = threadIdx.x, ty = threadIdx.y;
     int col = blockIdx.x * blockDim.x + tx;
@@ -62,47 +64,42 @@ __global__ void conv2d_shared_kernel(float* input, float* filter, float* output,
     int pad = R / 2;
 
     int sh_W = BLOCK_SIZE + 2 * pad;
+    int sh_H = BLOCK_SIZE + 2 * pad;
+
     int local_r = ty + pad;
     int local_c = tx + pad;
 
-    float* sh = sh_input;
+    // Load filter into shared memory (only once per block)
+    if (tx == 0 && ty == 0) {
+        for (int i = 0; i < R * R; ++i) {
+            sh_filter[i] = filter[k * R * R + i];
+        }
+    }
 
-    // Initialize all shared memory tile to 0
-    for (int i = ty; i < sh_W; i += blockDim.y)
-        for (int j = tx; j < sh_W; j += blockDim.x)
-            sh[i * sh_W + j] = 0.0f;
+    // Load shared memory tile
+    for (int i = ty; i < sh_H; i += blockDim.y) {
+        for (int j = tx; j < sh_W; j += blockDim.x) {
+            int global_r = blockIdx.y * BLOCK_SIZE + i - pad;
+            int global_c = blockIdx.x * BLOCK_SIZE + j - pad;
 
-    __syncthreads();
-
-    // Load center and halos into shared memory with bounds checks
-    if ((row < H) && (col < W))
-        sh[local_r * sh_W + local_c] = input[n * H * W + row * W + col];
-
-    if (tx < pad && col >= pad)
-        sh[local_r * sh_W + (local_c - pad)] = input[n * H * W + row * W + (col - pad)];
-    if (tx >= BLOCK_SIZE - pad && col + pad < W)
-        sh[local_r * sh_W + (local_c + pad)] = input[n * H * W + row * W + (col + pad)];
-    if (ty < pad && row >= pad)
-        sh[(local_r - pad) * sh_W + local_c] = input[n * H * W + (row - pad) * W + col];
-    if (ty >= BLOCK_SIZE - pad && row + pad < H)
-        sh[(local_r + pad) * sh_W + local_c] = input[n * H * W + (row + pad) * W + col];
-
-    if (tx < pad && ty < pad && row >= pad && col >= pad)
-        sh[(local_r - pad) * sh_W + (local_c - pad)] = input[n * H * W + (row - pad) * W + (col - pad)];
-    if (tx >= BLOCK_SIZE - pad && ty < pad && row >= pad && col + pad < W)
-        sh[(local_r - pad) * sh_W + (local_c + pad)] = input[n * H * W + (row - pad) * W + (col + pad)];
-    if (tx < pad && ty >= BLOCK_SIZE - pad && row + pad < H && col >= pad)
-        sh[(local_r + pad) * sh_W + (local_c - pad)] = input[n * H * W + (row + pad) * W + (col - pad)];
-    if (tx >= BLOCK_SIZE - pad && ty >= BLOCK_SIZE - pad && row + pad < H && col + pad < W)
-        sh[(local_r + pad) * sh_W + (local_c + pad)] = input[n * H * W + (row + pad) * W + (col + pad)];
+            if (global_r >= 0 && global_r < H && global_c >= 0 && global_c < W)
+                sh_input[i * sh_W + j] = input[n * H * W + global_r * W + global_c];
+            else
+                sh_input[i * sh_W + j] = 0.0f;
+        }
+    }
 
     __syncthreads();
 
     if (row < H && col < W) {
         float sum = 0.0f;
-        for (int i = 0; i < R; ++i)
-            for (int j = 0; j < R; ++j)
-                sum += sh[(local_r + i - pad) * sh_W + (local_c + j - pad)] * filter[k * R * R + i * R + j];
+        for (int i = 0; i < R; ++i) {
+            for (int j = 0; j < R; ++j) {
+                int sh_idx = (local_r + i - pad) * sh_W + (local_c + j - pad);
+                int f_idx = i * R + j;
+                sum += sh_input[sh_idx] * sh_filter[f_idx];
+            }
+        }
         output[nk * H * W + row * W + col] = sum;
     }
 }
@@ -147,4 +144,5 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+
 
