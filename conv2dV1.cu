@@ -1,10 +1,3 @@
-#include <iostream>
-#include <cuda.h>
-#include <fstream>
-#include <iomanip>
-
-#define BLOCK_SIZE 16
-
 void readInput(const char* fileName, float*& h_input, int& H, int& W, int& N) {
     std::ifstream inFile(fileName);
     if (!inFile) {
@@ -50,27 +43,55 @@ void writeOutput(float* h_output, int H, int W, int N, int K) {
     }
 }
 
-__global__ void conv2d_kernel(float* input, float* filter, float* output, int H, int W, int N, int K, int R) {
+__global__ void conv2d_shared_kernel(float* input, float* filter, float* output, int H, int W, int N, int K, int R) {
+    extern __shared__ float sh_input[];
+    __shared__ float sh_filter[MAX_FILTER_SIZE];
+
     int tx = threadIdx.x, ty = threadIdx.y;
     int col = blockIdx.x * blockDim.x + tx;
     int row = blockIdx.y * blockDim.y + ty;
     int nk = blockIdx.z;
     int n = nk / K;
     int k = nk % K;
+    int pad = R / 2;
+
+    int sh_W = BLOCK_SIZE + 2 * pad;
+    int sh_H = BLOCK_SIZE + 2 * pad;
+
+    int local_r = ty + pad;
+    int local_c = tx + pad;
+
+    // Load filter into shared memory (only once per block)
+    if (tx == 0 && ty == 0) {
+        for (int i = 0; i < R * R; ++i) {
+            sh_filter[i] = filter[k * R * R + i];
+        }
+    }
+
+    // Load shared memory tile
+    for (int i = ty; i < sh_H; i += blockDim.y) {
+        for (int j = tx; j < sh_W; j += blockDim.x) {
+            int global_r = blockIdx.y * BLOCK_SIZE + i - pad;
+            int global_c = blockIdx.x * BLOCK_SIZE + j - pad;
+
+            if (global_r >= 0 && global_r < H && global_c >= 0 && global_c < W)
+                sh_input[i * sh_W + j] = input[n * H * W + global_r * W + global_c];
+            else
+                sh_input[i * sh_W + j] = 0.0f;
+        }
+    }
+
+    __syncthreads();
 
     if (row < H && col < W) {
         float sum = 0.0f;
-        int pad = R / 2;
-        for (int i = -pad; i <= pad; ++i)
-            for (int j = -pad; j <= pad; ++j) {
-                int r = row + i;
-                int c = col + j;
-                if (r >= 0 && r < H && c >= 0 && c < W) {
-                    int in_idx = n * H * W + r * W + c;
-                    int f_idx = k * (R * R) + (i + pad) * R + (j + pad);
-                    sum += input[in_idx] * filter[f_idx];
-                }
+        for (int i = 0; i < R; ++i) {
+            for (int j = 0; j < R; ++j) {
+                int sh_idx = (local_r + i - pad) * sh_W + (local_c + j - pad);
+                int f_idx = i * R + j;
+                sum += sh_input[sh_idx] * sh_filter[f_idx];
             }
+        }
         output[nk * H * W + row * W + col] = sum;
     }
 }
@@ -87,17 +108,18 @@ int main(int argc, char *argv[]) {
     readFilter(argv[2], h_filter, K, R);
 
     float *d_input, *d_filter, *d_output;
-    cudaMalloc((void**)&d_input, N * H * W * sizeof(float));
-    cudaMalloc((void**)&d_filter, K * R * R * sizeof(float));
-    cudaMalloc((void**)&d_output, N * K * H * W * sizeof(float));
+    cudaMalloc(&d_input, N * H * W * sizeof(float));
+    cudaMalloc(&d_filter, K * R * R * sizeof(float));
+    cudaMalloc(&d_output, N * K * H * W * sizeof(float));
 
     cudaMemcpy(d_input, h_input, N * H * W * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_filter, h_filter, K * R * R * sizeof(float), cudaMemcpyHostToDevice);
 
     dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
     dim3 gridDim((W + BLOCK_SIZE - 1) / BLOCK_SIZE, (H + BLOCK_SIZE - 1) / BLOCK_SIZE, N * K);
-    conv2d_kernel<<<gridDim, blockDim>>>(d_input, d_filter, d_output, H, W, N, K, R);
+    int sharedMemSize = (BLOCK_SIZE + 2 * (R / 2)) * (BLOCK_SIZE + 2 * (R / 2)) * sizeof(float);
 
+    conv2d_shared_kernel<<<gridDim, blockDim, sharedMemSize>>>(d_input, d_filter, d_output, H, W, N, K, R);
     cudaDeviceSynchronize();
 
     h_output = (float*)malloc(N * K * H * W * sizeof(float));
@@ -108,11 +130,11 @@ int main(int argc, char *argv[]) {
     cudaFree(d_input);
     cudaFree(d_filter);
     cudaFree(d_output);
-
     free(h_input);
     free(h_filter);
     free(h_output);
 
     return 0;
 }
+
 
